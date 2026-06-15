@@ -18,14 +18,32 @@ pub struct ProvisionedData {
     pub oem_strings: Vec<String>,
 }
 
+// Verify that KBS is healthy before attempting to provision.
+pub async fn health_check(
+    client: &reqwest::Client,
+    health_url: &str,
+) -> Result<(), Error> {
+    let response = client.get(health_url).send().await?;
+    let status = response.status();
+    tracing::debug!("Trustee health check: status={}", status);
+
+    if !status.is_success() {
+        return Err(Error::ProvisioningError(format!(
+            "Trustee health check failed: HTTP {}",
+            status
+        )));
+    }
+    Ok(())
+}
+
 pub async fn provision(
     client: &reqwest::Client,
-    trustee_url: &str,
+    provisioner_url: &str,
     name: &str,
     namespace: &str,
 ) -> Result<ProvisionedData, Error> {
     let response = client
-        .post(format!("{}/provision", trustee_url))
+        .post(format!("{}/provision", provisioner_url))
         .json(&serde_json::json!({
             "vm_name": name,
             "namespace": namespace,

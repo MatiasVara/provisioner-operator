@@ -159,7 +159,8 @@ async fn provision_vmi(
 
     tracing::info!("Contacting Trustee for {}/{}", namespace, name);
 
-    let data = trustee::provision(&ctx.http, &ctx.config.trustee_url, name, namespace).await?;
+    trustee::health_check(&ctx.http, &ctx.config.health_url()).await?;
+    let data = trustee::provision(&ctx.http, &ctx.config.provisioner_url(), name, namespace).await?;
 
     tracing::info!("Injecting initdata for {}/{}", namespace, name);
     kubevirt::inject_initdata(
@@ -241,7 +242,7 @@ async fn handle_deletion(
     tracing::info!("VMI {}/{} deleted, notifying Trustee", namespace, name);
     let url = format!(
         "{}/provision/{}/{}",
-        ctx.config.trustee_url, namespace, name
+        ctx.config.provisioner_url(), namespace, name
     );
     let response = ctx.http.delete(&url).send().await?;
     tracing::info!("Trustee cleanup response: status={}", response.status());

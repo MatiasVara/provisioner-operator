@@ -6,9 +6,9 @@
 // All fields have defaults so the operator can run out of the box in development.
 #[derive(Debug, Clone)]
 pub struct Config {
-    // Base URL of the Trustee provisioner plugin.
-    // Example: "http://trustee-plugin.trustee.svc.cluster.local:8080/kbs/v0/provisioner"
-    pub trustee_url: String,
+    // Base URL of the KBS server (scheme + host + port).
+    // Example: "http://trustee-plugin.trustee.svc.cluster.local:8080"
+    pub kbs_url: String,
 
     // Kubernetes namespace the operator watches for VMIs.
     // Set WATCH_NAMESPACE to an empty string to watch all namespaces (not yet supported).
@@ -18,9 +18,19 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         Self {
-            trustee_url: std::env::var("TRUSTEE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080/kbs/v0/provisioner".to_string()),
+            kbs_url: std::env::var("KBS_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
             namespace: std::env::var("WATCH_NAMESPACE").unwrap_or_else(|_| "default".to_string()),
         }
+    }
+
+    // Full URL for the provisioner plugin endpoint.
+    pub fn provisioner_url(&self) -> String {
+        format!("{}/kbs/v0/provisioner", self.kbs_url)
+    }
+
+    // Full URL for the KBS health check endpoint.
+    pub fn health_url(&self) -> String {
+        format!("{}/healthz", self.kbs_url)
     }
 }

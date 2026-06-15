@@ -123,7 +123,12 @@ has notified Trustee to clean up the associated provisioning data.
 The Trustee provisioner plugin is an HTTP service that manages per-VM secrets. The operator
 communicates with it via two REST calls:
 
-### Provision — `POST {TRUSTEE_URL}/provision`
+### Health check — `GET {KBS_URL}/healthz`
+
+Before provisioning, the operator calls the KBS health endpoint to verify the service
+is alive. If the health check fails, provisioning is skipped and retried later.
+
+### Provision — `POST {KBS_URL}/kbs/v0/provisioner/provision`
 
 Called when a new VMI needs configuration data. Request body:
 
@@ -149,7 +154,7 @@ The `mrconfigid` becomes `tdx.mrConfigId` in the VMI spec (used to extend the TD
 measurement). The `oemstring` is injected as an SMBIOS OEM string (Type 11), which the
 guest reads at boot to locate its secret in KBS.
 
-### Cleanup — `DELETE {TRUSTEE_URL}/provision/{namespace}/{name}`
+### Cleanup — `DELETE {KBS_URL}/kbs/v0/provisioner/provision/{namespace}/{name}`
 
 Called when the VMI is deleted. Trustee removes the provisioning record associated with
 the VM, revoking access to the KBS resource.
@@ -178,13 +183,13 @@ All configuration is via environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `TRUSTEE_URL` | `http://127.0.0.1:8080/kbs/v0/provisioner` | Base URL of the Trustee provisioner plugin. The operator appends `/provision` for POST and `/provision/{ns}/{name}` for DELETE. |
+| `KBS_URL` | `http://127.0.0.1:8080` | Base URL of the KBS server (scheme + host + port). The operator derives the provisioner endpoint (`/kbs/v0/provisioner/provision`) and the health check endpoint (`/healthz`) from this. |
 | `WATCH_NAMESPACE` | `default` | Kubernetes namespace to watch for VMIs. |
 
-Example for a Trustee plugin running at `10.44.34.144:8080`:
+Example for a KBS running at `10.44.34.144:8080`:
 
 ```bash
-export TRUSTEE_URL=http://10.44.34.144:8080/kbs/v0/provisioner
+export KBS_URL=http://10.44.34.144:8080
 export WATCH_NAMESPACE=default
 ./target/release/provisioner-operator
 ```
@@ -204,7 +209,7 @@ No `oc proxy` or external tooling is needed.
 ```bash
 # Point to the cluster where KubeVirt and Trustee are running
 export KUBECONFIG=~/.kube/config
-export TRUSTEE_URL=http://<trustee-host>:<port>/kbs/v0/provisioner
+export KBS_URL=http://<kbs-host>:<port>
 export WATCH_NAMESPACE=default
 export RUST_LOG=info   # set to debug for verbose HTTP logs
 
