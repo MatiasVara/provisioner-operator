@@ -4,6 +4,9 @@ mod error;
 mod kubevirt;
 mod trustee;
 
+#[cfg(all(feature = "tdx", feature = "sev"))]
+compile_error!("Features \"tdx\" and \"sev\" are mutually exclusive. Enable only one.");
+
 // SPDX-FileCopyrightText: Matias Ezequiel Vara Larsen <mvaralar@redhat.com>
 //
 // SPDX-License-Identifier: MIT

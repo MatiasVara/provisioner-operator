@@ -39,14 +39,27 @@ pub struct DomainSpec {
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 pub struct LaunchSecurity {
+    #[cfg(feature = "tdx")]
     pub tdx: Option<TDX>,
+    #[cfg(feature = "sev")]
+    #[serde(rename = "sevSnp")]
+    pub sev_snp: Option<SEVSNP>,
 }
 
+#[cfg(feature = "tdx")]
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 pub struct TDX {
     pub attestation: Option<serde_json::Value>,
     #[serde(rename = "mrConfigId", default)]
     pub mr_config_id: String,
+}
+
+#[cfg(feature = "sev")]
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+pub struct SEVSNP {
+    pub attestation: Option<serde_json::Value>,
+    #[serde(rename = "hostData", default)]
+    pub host_data: String,
 }
 
 pub struct Context {
@@ -74,6 +87,7 @@ pub async fn reconcile(
         .and_then(|s| s.phase.as_deref())
         .unwrap_or("");
 
+    #[cfg(feature = "tdx")]
     let needs_provisioning = phase == "Scheduled"
         && vmi
             .spec
@@ -82,6 +96,17 @@ pub async fn reconcile(
             .and_then(|d| d.launch_security.as_ref())
             .and_then(|ls| ls.tdx.as_ref())
             .map(|tdx| tdx.attestation.is_some() && tdx.mr_config_id.is_empty())
+            .unwrap_or(false);
+
+    #[cfg(feature = "sev")]
+    let needs_provisioning = phase == "Scheduled"
+        && vmi
+            .spec
+            .domain
+            .as_ref()
+            .and_then(|d| d.launch_security.as_ref())
+            .and_then(|ls| ls.sev_snp.as_ref())
+            .map(|snp| snp.attestation.is_some() && snp.host_data.is_empty())
             .unwrap_or(false);
 
     if needs_provisioning {
@@ -139,10 +164,12 @@ async fn provision_vmi(
 
     // Re-read VMI from API to avoid stale cache triggering duplicate provisioning.
     // Each patch (finalizer, injectInitdata) triggers a new reconcile event, which
-    // may arrive with an outdated cached copy that still shows mrConfigId as empty.
+    // may arrive with an outdated cached copy that still shows the initdata field as empty.
     let api: kube::Api<VirtualMachineInstance> =
         kube::Api::namespaced(ctx.client.clone(), namespace);
     let current = api.get(name).await?;
+
+    #[cfg(feature = "tdx")]
     let already_provisioned = current
         .spec
         .domain
@@ -150,6 +177,16 @@ async fn provision_vmi(
         .and_then(|d| d.launch_security.as_ref())
         .and_then(|ls| ls.tdx.as_ref())
         .map(|tdx| !tdx.mr_config_id.is_empty())
+        .unwrap_or(false);
+
+    #[cfg(feature = "sev")]
+    let already_provisioned = current
+        .spec
+        .domain
+        .as_ref()
+        .and_then(|d| d.launch_security.as_ref())
+        .and_then(|ls| ls.sev_snp.as_ref())
+        .map(|snp| !snp.host_data.is_empty())
         .unwrap_or(false);
 
     if already_provisioned {
@@ -168,6 +205,7 @@ async fn provision_vmi(
         namespace,
         name,
         &data.mr_config_id,
+        &data.hostdata,
         &data.oem_strings,
     )
     .await?;

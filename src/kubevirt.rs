@@ -4,33 +4,44 @@
 
 use crate::error::Error;
 
-// Injects mrConfigId and oemStrings into a VMI via the KubeVirt tdx/injectInitdata subresource.
+// Injects attestation data into a VMI via a KubeVirt injectInitdata subresource.
 //
-// Instead of calling the Kubernetes API server through an oc proxy (an external HTTP proxy
-// running on localhost), we use the kube::Client directly. The client already holds valid
-// credentials (kubeconfig locally, or a ServiceAccount token when running in-cluster), so
-// no proxy is needed.
+// For TDX: injects mrConfigId + oemStrings via tdx/injectInitdata.
+// For SEV-SNP: injects hostData + oemStrings via sev/injectInitdata.
 //
 // The PUT request is built as a raw http::Request because kube-rs does not have a typed
-// binding for KubeVirt subresources. The client routes the request to the correct API server
-// and handles authentication automatically.
+// binding for KubeVirt subresources. The kube::Client routes the request to the correct
+// API server and handles authentication automatically (kubeconfig or ServiceAccount token).
 pub async fn inject_initdata(
     client: &kube::Client,
     namespace: &str,
     name: &str,
-    mr_config_id: &str,
+    _mr_config_id: &str,
+    _hostdata: &str,
     oem_strings: &[String],
 ) -> Result<(), Error> {
+    #[cfg(feature = "tdx")]
     let payload = serde_json::json!({
-        "mrConfigId": mr_config_id,
+        "mrConfigId": _mr_config_id,
         "oemStrings": oem_strings,
     });
+
+    #[cfg(feature = "sev")]
+    let payload = serde_json::json!({
+        "hostData": _hostdata,
+        "oemStrings": oem_strings,
+    });
+
+    #[cfg(feature = "tdx")]
+    let feature_name = "tdx";
+    #[cfg(feature = "sev")]
+    let feature_name = "sev";
 
     let req = http::Request::builder()
         .method(http::Method::PUT)
         .uri(format!(
-            "/apis/subresources.kubevirt.io/v1/namespaces/{}/virtualmachineinstances/{}/tdx/injectInitdata",
-            namespace, name
+            "/apis/subresources.kubevirt.io/v1/namespaces/{}/virtualmachineinstances/{}/{}/injectInitdata",
+            namespace, name, feature_name
         ))
         .header("Content-Type", "application/json")
         .body(

@@ -9,12 +9,14 @@ use crate::error::Error;
 #[derive(Deserialize)]
 pub struct TrusteeResponse {
     pub mrconfigid: String,
+    pub hostdata: String,
     pub oemstring: String,
 }
 
 // Internal representation mapping Trustee field names to KubeVirt subresource names
 pub struct ProvisionedData {
     pub mr_config_id: String,
+    pub hostdata: String,
     pub oem_strings: Vec<String>,
 }
 
@@ -72,6 +74,7 @@ pub async fn provision(
 
     Ok(ProvisionedData {
         mr_config_id: parsed.mrconfigid,
+        hostdata: parsed.hostdata,
         oem_strings: vec![parsed.oemstring],
     })
 }

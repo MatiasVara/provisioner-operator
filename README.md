@@ -144,15 +144,19 @@ Response body (fields used by the operator):
 ```json
 {
   "uuid": "2b48b128-d053-418f-8183-fc6f6d3cf612",
-  "mrconfigid": "<base64-encoded 48-byte value>",
+  "mrconfigid": "<base64-encoded SHA-384 digest of initdata.toml (48 bytes)>",
+  "hostdata": "<base64-encoded SHA-384 digest of initdata.toml, truncated to 32 bytes>",
   "oemstring": "kbs+provisioner:///default/2b48b128-.../root",
   "resource_path": "default/2b48b128-.../root"
 }
 ```
 
-The `mrconfigid` becomes `tdx.mrConfigId` in the VMI spec (used to extend the TDX
-measurement). The `oemstring` is injected as an SMBIOS OEM string (Type 11), which the
-guest reads at boot to locate its secret in KBS.
+- **`mrconfigid`**: used for Intel TDX — injected into `tdx.mrConfigId` (48 bytes).
+- **`hostdata`**: used for AMD SEV-SNP — injected into `sevSnp.hostData` (32 bytes).
+  Both are derived from the same SHA-384 hash; `hostdata` is truncated per the
+  [Initdata spec](https://github.com/confidential-containers/trustee/blob/main/kbs/docs/initdata.md).
+- **`oemstring`**: injected as a SMBIOS OEM string (Type 11) so the guest knows the
+  KBS URL and the resource path to fetch after attestation.
 
 ### Cleanup — `DELETE {KBS_URL}/kbs/v0/provisioner/provision/{namespace}/{name}`
 
@@ -163,16 +167,23 @@ the VM, revoking access to the KBS resource.
 
 ### Prerequisites
 
-- A Kubernetes cluster with KubeVirt installed (the custom `tdx/injectInitdata` subresource
-  must be present — it is not part of upstream KubeVirt yet).
+- A Kubernetes cluster with KubeVirt installed (the custom `tdx/injectInitdata` or
+  `sev/injectInitdata` subresource must be present — not part of upstream KubeVirt yet).
 - A running Trustee provisioner plugin reachable from the operator.
 - `kubectl` configured with access to the cluster (`~/.kube/config` or `KUBECONFIG`).
 - Rust toolchain (edition 2024, see `Cargo.toml`).
 
 ### Build
 
+The operator is compiled for a specific TEE platform using Cargo features.
+The features `tdx` and `sev` are mutually exclusive.
+
 ```bash
+# Build for Intel TDX (default)
 cargo build --release
+
+# Build for AMD SEV-SNP
+cargo build --release --no-default-features --features sev
 ```
 
 The binary is at `target/release/provisioner-operator`.

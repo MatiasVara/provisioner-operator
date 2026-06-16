@@ -19,3 +19,8 @@ futures = "0.3"
 schemars = "0.8"
 anyhow = "1"
 http = "1"
+
+[features]
+default = ["tdx"]
+tdx = []
+sev = []
