@@ -139,24 +139,28 @@ Called when a new VMI needs configuration data. Request body:
 }
 ```
 
-Response body (fields used by the operator):
+Response body:
 
 ```json
 {
   "uuid": "2b48b128-d053-418f-8183-fc6f6d3cf612",
-  "mrconfigid": "<base64-encoded SHA-384 digest of initdata.toml (48 bytes)>",
-  "hostdata": "<base64-encoded SHA-384 digest of initdata.toml, truncated to 32 bytes>",
-  "oemstring": "kbs+provisioner:///default/2b48b128-.../root",
   "resource_path": "default/2b48b128-.../root"
 }
 ```
 
-- **`mrconfigid`**: used for Intel TDX — injected into `tdx.mrConfigId` (48 bytes).
-- **`hostdata`**: used for AMD SEV-SNP — injected into `sevSnp.hostData` (32 bytes).
-  Both are derived from the same SHA-384 hash; `hostdata` is truncated per the
+- **`uuid`**: deterministic identifier for the VM (UUID v5 derived from namespace + name).
+- **`resource_path`**: KBS resource path where the LUKS key is stored.
+
+The operator then constructs the initdata locally using `KBS_URL` and `resource_path`,
+and derives the following values from it:
+
+- **`mrconfigid`**: base64-encoded SHA-384 digest of initdata.toml (48 bytes). Used for
+  Intel TDX — injected into `tdx.mrConfigId`.
+- **`hostdata`**: base64-encoded SHA-384 digest of initdata.toml, truncated to 32 bytes.
+  Used for AMD SEV-SNP — injected into `sevSnp.hostData`. Truncated per the
   [Initdata spec](https://github.com/confidential-containers/trustee/blob/main/kbs/docs/initdata.md).
-- **`oemstring`**: injected as a SMBIOS OEM string (Type 11) so the guest knows the
-  KBS URL and the resource path to fetch after attestation.
+- **`oemstring`**: base64-encoded initdata.toml, injected as a SMBIOS OEM string (Type 11)
+  so the guest knows the KBS URL and the resource path to fetch after attestation.
 
 ### Cleanup — `DELETE {KBS_URL}/kbs/v0/provisioner/provision/{namespace}/{name}`
 

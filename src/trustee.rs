@@ -8,9 +8,8 @@ use crate::error::Error;
 
 #[derive(Deserialize)]
 pub struct TrusteeResponse {
-    pub mrconfigid: String,
-    pub hostdata: String,
-    pub oemstring: String,
+    pub uuid: String,
+    pub resource_path: String,
 }
 
 // Internal representation mapping Trustee field names to KubeVirt subresource names
@@ -21,10 +20,7 @@ pub struct ProvisionedData {
 }
 
 // Verify that KBS is healthy before attempting to provision.
-pub async fn health_check(
-    client: &reqwest::Client,
-    health_url: &str,
-) -> Result<(), Error> {
+pub async fn health_check(client: &reqwest::Client, health_url: &str) -> Result<(), Error> {
     let response = client.get(health_url).send().await?;
     let status = response.status();
     tracing::debug!("Trustee health check: status={}", status);
@@ -41,6 +37,7 @@ pub async fn health_check(
 pub async fn provision(
     client: &reqwest::Client,
     provisioner_url: &str,
+    kbs_url: &str,
     name: &str,
     namespace: &str,
 ) -> Result<ProvisionedData, Error> {
@@ -72,9 +69,27 @@ pub async fn provision(
         ))
     })?;
 
+    let initdata_toml = format!(
+        "algorithm = \"sha384\"\n\
+         version = \"0.1.0\"\n\
+         \n\
+         [data]\n\
+         \"trustee.kbs.url\" = \"{}\"\n\
+         \"trustee.kbs.resource\" = \"kbs+provisioner:///{}\"\n",
+        kbs_url, parsed.resource_path
+    );
+
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
+    use sha2::{Digest, Sha384};
+
+    let oemstring = B64.encode(initdata_toml.as_bytes());
+    let digest = Sha384::digest(initdata_toml.as_bytes());
+    let mrconfigid = B64.encode(digest);
+    let hostdata = B64.encode(&digest[..32]);
+
     Ok(ProvisionedData {
-        mr_config_id: parsed.mrconfigid,
-        hostdata: parsed.hostdata,
-        oem_strings: vec![parsed.oemstring],
+        mr_config_id: mrconfigid,
+        hostdata,
+        oem_strings: vec![oemstring],
     })
 }
