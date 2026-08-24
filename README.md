@@ -192,6 +192,23 @@ cargo build --release --no-default-features --features sev
 
 The binary is at `target/release/provisioner-operator`.
 
+### Container image
+
+The `Dockerfile` in the project root builds the operator image. The `TEE_FEATURE`
+build argument selects the target platform:
+
+```bash
+# Build TDX image
+podman build --build-arg TEE_FEATURE=tdx -t quay.io/<org>/provisioner-operator:latest-tdx .
+
+# Build SEV-SNP image
+podman build --build-arg TEE_FEATURE=sev -t quay.io/<org>/provisioner-operator:latest-sev .
+
+# Push to registry
+podman push quay.io/<org>/provisioner-operator:latest-tdx
+podman push quay.io/<org>/provisioner-operator:latest-sev
+```
+
 ### Configuration
 
 All configuration is via environment variables:
@@ -200,13 +217,37 @@ All configuration is via environment variables:
 |---|---|---|
 | `KBS_URL` | `http://127.0.0.1:8080` | Base URL of the KBS server (scheme + host + port). The operator derives the provisioner endpoint (`/kbs/v0/provisioner/provision`) and the health check endpoint (`/healthz`) from this. |
 | `WATCH_NAMESPACE` | `default` | Kubernetes namespace to watch for VMIs. |
+| `RUST_LOG` | (none) | Log verbosity: `info` for lifecycle events, `debug` for HTTP details. |
 
-Example for a KBS running at `10.44.34.144:8080`:
+### Deploying in-cluster
+
+The manifests in `deploy/operator.yaml` create all the resources needed to run
+the operator as a pod: ServiceAccount, ClusterRole, ClusterRoleBinding, and
+Deployment.
+
+Before applying, edit `deploy/operator.yaml` to set:
+
+1. **`image:`** — your registry image (`latest-tdx` or `latest-sev`)
+2. **`KBS_URL`** — the in-cluster URL of the KBS (e.g. `http://kbs-service.trustee.svc.cluster.local:8080`)
+3. **`WATCH_NAMESPACE`** — the namespace where CVMs are created
+
+Then apply:
 
 ```bash
-export KBS_URL=http://10.44.34.144:8080
-export WATCH_NAMESPACE=default
-./target/release/provisioner-operator
+oc apply -f deploy/operator.yaml
+```
+
+Verify:
+
+```bash
+oc get pods -l app=provisioner-operator
+oc logs -l app=provisioner-operator -f
+```
+
+To remove:
+
+```bash
+oc delete -f deploy/operator.yaml
 ```
 
 ### Credentials
