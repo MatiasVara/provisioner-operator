@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: MIT
 
-use kube::CustomResource;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::api::{ObjectMeta, PatchParams, PostParams};
 use kube::runtime::controller::Action;
+use kube::{Api, CustomResource};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -11,8 +13,9 @@ use tokio::time::Duration;
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::kubevirt;
 use crate::trustee;
+
+// --- VMI types (partial, only the fields the operator needs) ---
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -39,28 +42,49 @@ pub struct DomainSpec {
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 pub struct LaunchSecurity {
-    #[cfg(feature = "tdx")]
-    pub tdx: Option<TDX>,
-    #[cfg(feature = "sev")]
+    pub tdx: Option<Tdx>,
     #[serde(rename = "sevSnp")]
-    pub sev_snp: Option<SEVSNP>,
+    pub sev_snp: Option<SevSnp>,
 }
 
-#[cfg(feature = "tdx")]
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub struct TDX {
-    pub attestation: Option<serde_json::Value>,
-    #[serde(rename = "mrConfigId", default)]
-    pub mr_config_id: String,
+pub struct Tdx {
+    #[serde(rename = "initDataRef", default)]
+    pub init_data_ref: String,
 }
 
-#[cfg(feature = "sev")]
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub struct SEVSNP {
-    pub attestation: Option<serde_json::Value>,
-    #[serde(rename = "hostData", default)]
-    pub host_data: String,
+pub struct SevSnp {
+    #[serde(rename = "initDataRef", default)]
+    pub init_data_ref: String,
 }
+
+// --- InitData CRD types ---
+
+#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "kubevirt.io",
+    version = "v1",
+    kind = "InitData",
+    namespaced,
+    status = "InitDataStatus"
+)]
+pub struct InitDataSpec {
+    #[serde(rename = "mrConfigId", skip_serializing_if = "Option::is_none")]
+    pub mr_config_id: Option<String>,
+    #[serde(rename = "hostData", skip_serializing_if = "Option::is_none")]
+    pub host_data: Option<String>,
+    #[serde(rename = "oemStrings")]
+    pub oem_strings: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+pub struct InitDataStatus {
+    #[serde(default)]
+    pub conditions: Option<Vec<serde_json::Value>>,
+}
+
+// --- Operator context ---
 
 pub struct Context {
     pub client: kube::Client,
@@ -69,6 +93,34 @@ pub struct Context {
 }
 
 const FINALIZER: &str = "provisioner-operator.confidentialcontainers.io/cleanup";
+
+/// TEE platform detected from the VMI spec.
+enum TeePlatform {
+    Tdx,
+    Snp,
+}
+
+/// Extracts the `initDataRef` value and TEE platform from a VMI.
+/// Returns `None` if neither TDX nor SNP has `initDataRef` set.
+fn extract_init_data_ref(vmi: &VirtualMachineInstance) -> Option<(String, TeePlatform)> {
+    let ls = vmi.spec.domain.as_ref()?.launch_security.as_ref()?;
+
+    if let Some(tdx) = &ls.tdx
+        && !tdx.init_data_ref.is_empty()
+    {
+        return Some((tdx.init_data_ref.clone(), TeePlatform::Tdx));
+    }
+
+    if let Some(snp) = &ls.sev_snp
+        && !snp.init_data_ref.is_empty()
+    {
+        return Some((snp.init_data_ref.clone(), TeePlatform::Snp));
+    }
+
+    None
+}
+
+// --- Reconcile loop ---
 
 pub async fn reconcile(
     vmi: Arc<VirtualMachineInstance>,
@@ -81,37 +133,54 @@ pub async fn reconcile(
         return handle_deletion(&vmi, &ctx).await;
     }
 
-    let phase = vmi
-        .status
-        .as_ref()
-        .and_then(|s| s.phase.as_deref())
-        .unwrap_or("");
+    let Some((init_data_ref, platform)) = extract_init_data_ref(&vmi) else {
+        return Ok(Action::requeue(Duration::from_secs(300)));
+    };
 
-    #[cfg(feature = "tdx")]
-    let needs_provisioning = phase == "Scheduled"
-        && vmi
-            .spec
-            .domain
-            .as_ref()
-            .and_then(|d| d.launch_security.as_ref())
-            .and_then(|ls| ls.tdx.as_ref())
-            .map(|tdx| tdx.attestation.is_some() && tdx.mr_config_id.is_empty())
-            .unwrap_or(false);
+    let initdata_api: Api<InitData> = Api::namespaced(ctx.client.clone(), namespace);
 
-    #[cfg(feature = "sev")]
-    let needs_provisioning = phase == "Scheduled"
-        && vmi
-            .spec
-            .domain
-            .as_ref()
-            .and_then(|d| d.launch_security.as_ref())
-            .and_then(|ls| ls.sev_snp.as_ref())
-            .map(|snp| snp.attestation.is_some() && snp.host_data.is_empty())
-            .unwrap_or(false);
+    match initdata_api.get(&init_data_ref).await {
+        Ok(existing) => {
+            let owned_by_us = existing
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|refs| refs.first())
+                .is_some_and(|r| {
+                    r.kind == "VirtualMachineInstance"
+                        && r.name == name
+                        && r.uid == vmi.metadata.uid.as_deref().unwrap_or("")
+                });
 
-    if needs_provisioning {
-        provision_vmi(name, namespace, &vmi, &ctx).await?;
+            if owned_by_us {
+                tracing::debug!(
+                    "InitData {} already exists for VMI {}/{}",
+                    init_data_ref,
+                    namespace,
+                    name
+                );
+                return Ok(Action::requeue(Duration::from_secs(300)));
+            }
+
+            tracing::error!(
+                "InitData {} already exists but is owned by a different VMI. \
+                 VMI {}/{} cannot reuse it — use a unique initDataRef name.",
+                init_data_ref,
+                namespace,
+                name
+            );
+            return Err(Error::Provisioning(format!(
+                "InitData {} is already owned by another VMI",
+                init_data_ref
+            )));
+        }
+        Err(kube::Error::Api(err)) if err.code == 404 => {
+            // InitData does not exist yet — proceed to provision
+        }
+        Err(e) => return Err(e.into()),
     }
+
+    provision_vmi(name, namespace, &init_data_ref, &platform, &vmi, &ctx).await?;
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }
@@ -125,6 +194,8 @@ pub fn error_policy(
     Action::requeue(Duration::from_secs(30))
 }
 
+// --- Finalizer management ---
+
 async fn ensure_finalizer(
     vmi: &VirtualMachineInstance,
     client: &kube::Client,
@@ -137,7 +208,7 @@ async fn ensure_finalizer(
         .unwrap_or(false);
 
     if !has_finalizer {
-        let api: kube::Api<VirtualMachineInstance> = kube::Api::namespaced(
+        let api: Api<VirtualMachineInstance> = Api::namespaced(
             client.clone(),
             vmi.metadata.namespace.as_deref().unwrap_or("default"),
         );
@@ -146,7 +217,7 @@ async fn ensure_finalizer(
         });
         api.patch(
             vmi.metadata.name.as_deref().unwrap_or(""),
-            &kube::api::PatchParams::apply("tdx-operator"),
+            &PatchParams::apply("provisioner-operator"),
             &kube::api::Patch::Merge(&patch),
         )
         .await?;
@@ -154,43 +225,26 @@ async fn ensure_finalizer(
     Ok(())
 }
 
+// --- Provisioning ---
+
 async fn provision_vmi(
     name: &str,
     namespace: &str,
+    init_data_ref: &str,
+    platform: &TeePlatform,
     vmi: &VirtualMachineInstance,
     ctx: &Arc<Context>,
 ) -> Result<(), Error> {
     ensure_finalizer(vmi, &ctx.client).await?;
 
-    // Re-read VMI from API to avoid stale cache triggering duplicate provisioning.
-    // Each patch (finalizer, injectInitdata) triggers a new reconcile event, which
-    // may arrive with an outdated cached copy that still shows the initdata field as empty.
-    let api: kube::Api<VirtualMachineInstance> =
-        kube::Api::namespaced(ctx.client.clone(), namespace);
-    let current = api.get(name).await?;
-
-    #[cfg(feature = "tdx")]
-    let already_provisioned = current
-        .spec
-        .domain
-        .as_ref()
-        .and_then(|d| d.launch_security.as_ref())
-        .and_then(|ls| ls.tdx.as_ref())
-        .map(|tdx| !tdx.mr_config_id.is_empty())
-        .unwrap_or(false);
-
-    #[cfg(feature = "sev")]
-    let already_provisioned = current
-        .spec
-        .domain
-        .as_ref()
-        .and_then(|d| d.launch_security.as_ref())
-        .and_then(|ls| ls.sev_snp.as_ref())
-        .map(|snp| !snp.host_data.is_empty())
-        .unwrap_or(false);
-
-    if already_provisioned {
-        tracing::info!("VMI {}/{} already provisioned, skipping", namespace, name);
+    // Re-check after finalizer patch to avoid duplicate provisioning from
+    // the reconcile event triggered by the finalizer patch itself.
+    let initdata_api: Api<InitData> = Api::namespaced(ctx.client.clone(), namespace);
+    if initdata_api.get(init_data_ref).await.is_ok() {
+        tracing::info!(
+            "InitData {} already exists (re-check), skipping",
+            init_data_ref
+        );
         return Ok(());
     }
 
@@ -206,60 +260,56 @@ async fn provision_vmi(
     )
     .await?;
 
-    tracing::info!("Injecting initdata for {}/{}", namespace, name);
-    kubevirt::inject_initdata(
-        &ctx.client,
+    tracing::info!(
+        "Creating InitData {} for VMI {}/{}",
+        init_data_ref,
         namespace,
-        name,
-        &data.mr_config_id,
-        &data.hostdata,
-        &data.oem_strings,
-    )
-    .await?;
+        name
+    );
 
-    // Wait for virt-handler to detect mrConfigId and start QEMU (VMI → Running)
-    // before calling unpause. Without this, unpause fails with "VMI is not running".
-    wait_for_running_phase(name, namespace, &ctx.client).await?;
+    let (mr_config_id, host_data) = match platform {
+        TeePlatform::Tdx => (Some(data.mr_config_id), None),
+        TeePlatform::Snp => (None, Some(data.hostdata)),
+    };
 
-    tracing::info!("Unpausing VMI {}/{}", namespace, name);
-    kubevirt::unpause(&ctx.client, namespace, name).await?;
+    let vmi_uid = vmi.metadata.uid.as_deref().unwrap_or("").to_string();
+
+    let initdata = InitData {
+        metadata: ObjectMeta {
+            name: Some(init_data_ref.to_string()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![OwnerReference {
+                api_version: "kubevirt.io/v1".to_string(),
+                kind: "VirtualMachineInstance".to_string(),
+                name: name.to_string(),
+                uid: vmi_uid,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        },
+        spec: InitDataSpec {
+            mr_config_id,
+            host_data,
+            oem_strings: data.oem_strings,
+        },
+        status: None,
+    };
+
+    initdata_api
+        .create(&PostParams::default(), &initdata)
+        .await?;
+
+    tracing::info!(
+        "InitData {} created for VMI {}/{}",
+        init_data_ref,
+        namespace,
+        name
+    );
 
     Ok(())
 }
 
-async fn wait_for_running_phase(
-    name: &str,
-    namespace: &str,
-    client: &kube::Client,
-) -> Result<(), Error> {
-    let api: kube::Api<VirtualMachineInstance> = kube::Api::namespaced(client.clone(), namespace);
-
-    for attempt in 1..=30 {
-        let vmi = api.get(name).await?;
-        let phase = vmi
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.as_deref())
-            .unwrap_or("");
-
-        tracing::debug!(
-            "Waiting for Running phase, attempt {}/30, current phase={}",
-            attempt,
-            phase
-        );
-
-        if phase == "Running" {
-            return Ok(());
-        }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    Err(Error::ProvisioningError(format!(
-        "VMI {}/{} did not reach Running phase within 60 seconds",
-        namespace, name
-    )))
-}
+// --- Deletion / cleanup ---
 
 async fn handle_deletion(
     vmi: &VirtualMachineInstance,
@@ -294,15 +344,16 @@ async fn handle_deletion(
     let response = ctx.http.delete(&url).send().await?;
     tracing::info!("Trustee cleanup response: status={}", response.status());
 
+    // The InitData CR is garbage-collected by Kubernetes via ownerReference.
+
     tracing::info!("Removing finalizer from VMI {}/{}", namespace, name);
-    let api: kube::Api<VirtualMachineInstance> =
-        kube::Api::namespaced(ctx.client.clone(), namespace);
+    let api: Api<VirtualMachineInstance> = Api::namespaced(ctx.client.clone(), namespace);
     let patch = serde_json::json!({
         "metadata": { "finalizers": [] }
     });
     api.patch(
         name,
-        &kube::api::PatchParams::apply("provisioner-operator"),
+        &PatchParams::apply("provisioner-operator"),
         &kube::api::Patch::Merge(&patch),
     )
     .await?;

@@ -1,11 +1,7 @@
 mod config;
 mod controller;
 mod error;
-mod kubevirt;
 mod trustee;
-
-#[cfg(all(feature = "tdx", feature = "sev"))]
-compile_error!("Features \"tdx\" and \"sev\" are mutually exclusive. Enable only one.");
 
 // SPDX-FileCopyrightText: Matias Ezequiel Vara Larsen <mvaralar@redhat.com>
 //
@@ -41,7 +37,6 @@ async fn main() -> anyhow::Result<()> {
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {
             if let Err(e) = result {
-                // ObjectNotFound is expected after a VMI is fully deleted
                 let msg = format!("{:?}", e);
                 if msg.contains("ObjectNotFound") {
                     tracing::debug!("VMI no longer exists (already deleted): {}", msg);
