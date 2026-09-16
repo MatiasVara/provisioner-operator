@@ -12,14 +12,9 @@ rules:
 - apiGroups: ["kubevirt.io"]
   resources: ["virtualmachineinstances"]
   verbs: ["get", "list", "watch", "patch"]
-- apiGroups: ["subresources.kubevirt.io"]
-  resources:
-  - "virtualmachineinstances/tdx"
-  - "virtualmachineinstances/tdx/injectInitdata"
-  - "virtualmachineinstances/sev"
-  - "virtualmachineinstances/sev/injectInitdata"
-  - "virtualmachineinstances/unpause"
-  verbs: ["update"]
+- apiGroups: ["kubevirt.io"]
+  resources: ["initdatas"]
+  verbs: ["get", "list", "watch", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -52,12 +47,11 @@ spec:
       serviceAccountName: provisioner-operator
       containers:
       - name: operator
-        # Use the TDX or SEV image depending on the target platform
-        image: quay.io/mvaralar/provisioner-operator:latest-tdx
+        image: quay.io/mvaralar/provisioner-operator:latest
         imagePullPolicy: Always
         env:
         - name: KBS_URL
-          value: "http://xxx.xxx.xxx.xxx:8080"
+          value: "http://xx.xx.xx.xx:8080"
         - name: WATCH_NAMESPACE
           value: "default"
         - name: RUST_LOG

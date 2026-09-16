@@ -1,35 +1,37 @@
 # provisioner-operator
 
 A Kubernetes operator written in Rust that automates the attestation provisioning flow
-for confidential Virtual Machines (CVMs) running on KubeVirt with Intel TDX and AMD SEV.
+for confidential Virtual Machines (CVMs) running on KubeVirt with Intel TDX and AMD SEV-SNP.
 
 ## Architecture
 
 The operator bridges two external systems: the **Trustee provisioner plugin** (which holds
-VM-specific secrets) and **KubeVirt** (which runs the VM). It watches for VMIs that declare
-they need attestation, fetches their initial configuration data from Trustee, injects it into
-the VMI before QEMU starts, and then unpauses the VM so the guest can boot. This is the
-behavior when a YAML description requires some external operator to inject measurements before it boots up.
+VM-specific secrets) and **KubeVirt** (which runs the VM). It watches for VMIs whose
+`launchSecurity` section contains an `initDataRef`, fetches the initial configuration data
+from Trustee, and creates an **InitData** custom resource that KubeVirt's virt-handler
+consumes before starting QEMU.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Kubernetes Cluster                       │
-│                                                             │
-│  ┌──────────────────┐       ┌──────────────────────────┐   │
-│  │ provisioner-     │ watch │  VirtualMachineInstance   │   │
-│  │ operator         │──────>│  (phase: Scheduled)       │   │
-│  │                  │       │  tdx.attestation: {}      │   │
-│  │                  │       │  tdx.mrConfigId: ""       │   │
-│  └────────┬─────────┘       └──────────────────────────┘   │
+┌──────────────────────────────────────────────────────────────┐
+│                      Kubernetes Cluster                       │
+│                                                              │
+│  ┌──────────────────┐  watch  ┌───────────────────────────┐ │
+│  │ provisioner-     │────────>│  VirtualMachineInstance    │ │
+│  │ operator         │         │  tdx:                     │ │
+│  │                  │         │    initDataRef: "vm-tdx1"  │ │
+│  └────────┬─────────┘         └───────────────────────────┘ │
 │           │                                                  │
-│           │ POST /provision          PUT tdx/injectInitdata  │
-│           │ DELETE /provision/{ns}/{name}   PUT unpause      │
+│           │ POST /provision                                  │
+│           │ DELETE /provision/{ns}/{name}                     │
 │           │                                                  │
-│  ┌────────▼─────────┐       ┌──────────────────────────┐   │
-│  │ Trustee           │       │  KubeVirt subresource     │   │
-│  │ provisioner plugin│       │  API (virt-api)           │   │
-│  └──────────────────┘       └──────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+│  ┌────────▼─────────┐  create ┌───────────────────────────┐ │
+│  │ Trustee           │         │  InitData CR              │ │
+│  │ provisioner plugin│ ─ ─ ─ >│  name: "vm-tdx1"          │ │
+│  └──────────────────┘         │  mrConfigId: <digest>     │ │
+│                               │  oemStrings: [<b64 toml>] │ │
+│                               │  ownerRef → VMI           │ │
+│                               └───────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 The operator is built with [`kube-rs`](https://github.com/kube-rs/kube) and uses its
@@ -37,86 +39,92 @@ controller runtime for watch/reconcile loops and its `Client` for Kubernetes API
 
 ## Interaction with KubeVirt
 
-The operator relies on two KubeVirt subresource endpoints under
-`/apis/subresources.kubevirt.io/v1/`:
+The operator creates an **InitData** custom resource that virt-handler reads
+before launching QEMU.
 
-### 1. Inject initdata — `PUT .../virtualmachineinstances/{name}/tdx/injectInitdata`
+### Reconcile flow
 
-Injects the TDX configuration data into the VMI before QEMU starts. The request body is:
-
-```json
-{
-  "mrConfigId": "<base64-encoded 48-byte TDX measurement config ID>",
-  "oemStrings": ["<path to secret in KBS, e.g. kbs:///default/uuid/root>"]
-}
-```
-
-This endpoint is only accepted while the VMI is in the `Scheduled` phase (virt-handler
-has claimed the VMI but QEMU has not started yet) and the VMI has `tdx.attestation: {}`
-set in its spec. After injection, virt-handler starts QEMU with the provided values.
-
-### 2. Unpause — `PUT .../virtualmachineinstances/{name}/unpause`
-
-The VMI is created with `startStrategy: Paused` so that QEMU boots in paused state,
-giving the operator a window to inject the attestation data. Once injection is complete
-and the VMI reaches the `Running` phase (QEMU started but execution is paused), the
-operator calls this endpoint to resume execution.
-
-> **Note:** the `unpause` subresource is registered under `virtualmachineinstances` in
-> this KubeVirt build. You can verify it with:
-> ```bash
-> kubectl get --raw /apis/subresources.kubevirt.io/v1 | python3 -m json.tool | grep unpause
-> ```
+1. A VMI is created with `initDataRef` in its `launchSecurity` (TDX or SEV-SNP).
+2. The operator detects the VMI and checks whether an `InitData` CR with the referenced
+   name already exists.
+3. If not, it contacts Trustee to obtain the VM's provisioning data.
+4. It constructs the initdata TOML, computes the measurement digest, and creates the
+   `InitData` CR with an `ownerReference` pointing back to the VMI.
+5. KubeVirt's virt-handler picks up the `InitData` CR and starts QEMU with the provided
+   `mrConfigId` (TDX) or `hostData` (SEV-SNP) and `oemStrings`.
 
 ### VMI spec requirements
 
-The VM must be created with the following fields in `spec.template.spec`.
+The VM must declare `initDataRef` inside `launchSecurity`. The referenced name is also
+the name of the `InitData` CR that the operator will create.
+
+> **Convention:** use the VMI name as the `initDataRef` value (e.g. `initDataRef: "my-vm"`).
+> Since VMI names are unique within a namespace, this guarantees that no two VMIs will
+> reference the same `InitData` CR. The operator validates ownership and will reject a
+> VMI whose `initDataRef` points to an `InitData` CR already owned by a different VMI.
 
 #### Intel TDX
 
 ```yaml
-startStrategy: Paused
 domain:
   launchSecurity:
     tdx:
-      attestation: {}   # signals to the operator that provisioning is needed
+      initDataRef: "vm-tdx1"
   firmware:
     bootloader:
       efi:
         secureBoot: false
 ```
-
-The operator checks for `tdx.attestation` being present and `tdx.mrConfigId` being empty
-to decide whether provisioning is needed. After injection, `mrConfigId` holds a
-base64-encoded 48-byte value that extends the TDX measurement (MRCONFIGID register).
 
 #### AMD SEV-SNP
 
-> **Note:** SEV-SNP support is not yet implemented in the operator. The KubeVirt API
-> fields described below are defined but the reconcile loop currently only handles TDX.
-
 ```yaml
-startStrategy: Paused
 domain:
   launchSecurity:
     sevSnp:
-      attestation: {}   # analogous to TDX — signals provisioning is needed
+      initDataRef: "vm-snp1"
   firmware:
     bootloader:
       efi:
         secureBoot: false
 ```
 
-For SEV-SNP the equivalent of `mrConfigId` is `hostData`, a base64-encoded 32-byte value
-that is passed as the `HOST_DATA` measurement during VM launch. The `oemStrings` field
-works identically to TDX and carries the KBS resource path for the guest to fetch its
-secret after attestation.
+The operator handles both platforms in a single binary. For TDX it populates `mrConfigId`
+(base64-encoded SHA-384, 48 bytes); for SEV-SNP it populates `hostData` (base64-encoded
+SHA-256, 32 bytes). In both cases `oemStrings` carries the base64-encoded initdata TOML
+so the guest knows the KBS URL and resource path.
+
+### InitData CR
+
+The operator creates an `InitData` resource like:
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: InitData
+metadata:
+  name: vm-tdx1          # matches initDataRef in the VMI
+  namespace: default
+  ownerReferences:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: my-vm
+    uid: <vmi-uid>
+spec:
+  mrConfigId: "<base64 SHA-384 digest>"     # TDX only
+  # hostData: "<base64 SHA-256 digest>"     # SEV-SNP only
+  oemStrings:
+  - "<base64-encoded initdata.toml>"
+```
+
+The `ownerReference` ensures the `InitData` CR is garbage-collected when the VMI is
+deleted.
 
 ### Finalizer
 
 The operator adds a finalizer (`provisioner-operator.confidentialcontainers.io/cleanup`)
 to each provisioned VMI. This blocks Kubernetes from deleting the VMI until the operator
-has notified Trustee to clean up the associated provisioning data.
+has notified Trustee to clean up the associated provisioning data. The `InitData` CR
+itself is garbage-collected automatically via its `ownerReference`.
 
 ## Interaction with Trustee provisioner plugin
 
@@ -151,15 +159,14 @@ Response body:
 - **`uuid`**: deterministic identifier for the VM (UUID v5 derived from namespace + name).
 - **`resource_path`**: KBS resource path where the LUKS key is stored.
 
-The operator then constructs the initdata locally using `KBS_URL` and `resource_path`,
+The operator then constructs the initdata TOML locally using `KBS_URL` and `resource_path`,
 and derives the following values from it:
 
-- **`mrconfigid`**: base64-encoded SHA-384 digest of initdata.toml (48 bytes). Used for
-  Intel TDX — injected into `tdx.mrConfigId`.
-- **`hostdata`**: base64-encoded SHA-384 digest of initdata.toml, truncated to 32 bytes.
-  Used for AMD SEV-SNP — injected into `sevSnp.hostData`. Truncated per the
-  [Initdata spec](https://github.com/confidential-containers/trustee/blob/main/kbs/docs/initdata.md).
-- **`oemstring`**: base64-encoded initdata.toml, injected as a SMBIOS OEM string (Type 11)
+- **`mrConfigId`**: base64-encoded SHA-384 digest of initdata.toml (48 bytes). Used for
+  Intel TDX — stored in `InitData.spec.mrConfigId`.
+- **`hostData`**: base64-encoded SHA-256 digest of initdata.toml (32 bytes).
+  Used for AMD SEV-SNP — stored in `InitData.spec.hostData`.
+- **`oemStrings`**: base64-encoded initdata.toml, injected as a SMBIOS OEM string (Type 11)
   so the guest knows the KBS URL and the resource path to fetch after attestation.
 
 ### Cleanup — `DELETE {KBS_URL}/kbs/v0/provisioner/provision/{namespace}/{name}`
@@ -171,42 +178,29 @@ the VM, revoking access to the KBS resource.
 
 ### Prerequisites
 
-- A Kubernetes cluster with KubeVirt installed (the custom `tdx/injectInitdata` or
-  `sev/injectInitdata` subresource must be present — not part of upstream KubeVirt yet).
+- A Kubernetes cluster with KubeVirt installed (the `InitData` CRD must be registered —
+  see the [InitData VEP](https://github.com/kubevirt/enhancements/pull/340)).
 - A running Trustee provisioner plugin reachable from the operator.
 - `kubectl` configured with access to the cluster (`~/.kube/config` or `KUBECONFIG`).
-- Rust toolchain (edition 2024, see `Cargo.toml`).
 
 ### Build
 
-The operator is compiled for a specific TEE platform using Cargo features.
-The features `tdx` and `sev` are mutually exclusive.
+The operator handles both TDX and SEV-SNP in a single binary.
 
 ```bash
-# Build for Intel TDX (default)
 cargo build --release
-
-# Build for AMD SEV-SNP
-cargo build --release --no-default-features --features sev
 ```
 
 The binary is at `target/release/provisioner-operator`.
 
 ### Container image
 
-The `Dockerfile` in the project root builds the operator image. The `TEE_FEATURE`
-build argument selects the target platform:
+The `Dockerfile` in the project root builds the operator image:
 
 ```bash
-# Build TDX image
-podman build --build-arg TEE_FEATURE=tdx -t quay.io/<org>/provisioner-operator:latest-tdx .
+podman build -t quay.io/<org>/provisioner-operator:latest .
 
-# Build SEV-SNP image
-podman build --build-arg TEE_FEATURE=sev -t quay.io/<org>/provisioner-operator:latest-sev .
-
-# Push to registry
-podman push quay.io/<org>/provisioner-operator:latest-tdx
-podman push quay.io/<org>/provisioner-operator:latest-sev
+podman push quay.io/<org>/provisioner-operator:latest
 ```
 
 ### Configuration
@@ -227,7 +221,7 @@ Deployment.
 
 Before applying, edit `deploy/operator.yaml` to set:
 
-1. **`image:`** — your registry image (`latest-tdx` or `latest-sev`)
+1. **`image:`** — your registry image
 2. **`KBS_URL`** — the in-cluster URL of the KBS (e.g. `http://kbs-service.trustee.svc.cluster.local:8080`)
 3. **`WATCH_NAMESPACE`** — the namespace where CVMs are created
 
@@ -257,8 +251,6 @@ credentials in this order:
 
 1. **In-cluster**: if running as a pod, uses the mounted ServiceAccount token.
 2. **Local**: uses `~/.kube/config` (or the path in `$KUBECONFIG`).
-
-No `oc proxy` or external tooling is needed.
 
 ### Running locally (out-of-cluster)
 
@@ -338,17 +330,3 @@ The connection is rejected if either side cannot prove its identity.
 - More operational complexity: requires a CA, certificate issuance, and mount configuration.
 - Natural fit for the confidential containers ecosystem, where mTLS is already used for
   inter-component communication.
-
----
-
-## Source layout
-
-```
-src/
-├── main.rs         # entry point: sets up the kube-rs controller and wires dependencies
-├── controller.rs   # reconcile loop: watches VMIs, drives the provisioning state machine
-├── trustee.rs      # HTTP client for the Trustee provisioner plugin
-├── kubevirt.rs     # HTTP client for KubeVirt subresource API (inject, unpause)
-├── config.rs       # configuration from environment variables
-└── error.rs        # custom error types (thiserror)
-```
